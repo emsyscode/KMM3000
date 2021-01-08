@@ -1,0 +1,771 @@
+
+//set your clock speed
+//Note: The atmega328PB is working with a internal clock
+#define F_CPU 8000000
+
+#include <avr/io.h>
+//#include <iom1284p.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+// Standard Input/Output functions 1284
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <util/atomic.h>
+#include <stdbool.h>
+
+volatile uint8_t portbhistory = 0xFF;     // default is high because the pull-up
+
+ /* A global flag used to communicate between the Interrupt Service Routine
+ *  and the main program.  It has to be declared volatile or the compiler
+ *  might optimize it out.*/
+  
+volatile bool update = false;    // update = true;  // see the <lib stdbool.h>
+
+#define FALSE 0
+#define TRUE (!FALSE)
+
+uint8_t now;
+uint8_t last;
+uint8_t number;
+
+typedef uint8_t byte;
+
+unsigned char tmp[14];
+int dataOverflows[14];
+
+volatile uint8_t chr1;
+volatile uint8_t chr2;
+
+#define rst6302 PINC2
+
+int testBit=0;
+char cntDebug=0;
+unsigned int counter=0;
+unsigned int triggerEvent=0;
+unsigned int numberEvents=0;
+unsigned int vectorOverflows[14];
+
+unsigned char SegPins;
+unsigned char Grid;
+
+byte data[14];
+byte dataIndex;
+
+byte inData;
+byte recData;
+
+byte edge;
+byte flagTF =0;  // flag to test true or false
+
+unsigned int overflows=0;
+unsigned int overflowsLED=0;
+unsigned int timer=0;
+
+#define start_length 8
+#define ONE_SIZE 4
+#define ZERO_SIZE 1
+
+#define BIT_IS_SET(byte, bit) (byte & (1 << bit))
+
+#define BIT_IS_CLEAR(byte, bit) (!(byte & (1 << bit)))
+
+#define VFD_clk PINB6	//Pin to provide Clock to the PT6302
+#define VFD_in PINB7	//Pin to provide the Data In to the PT6302
+#define VFD_stb PINB0	//Pin to provide the signal of Strobe to the PT6302
+
+#define isLow() (!(PIND&~_BV(PIND2)))
+	
+	#define BIN(x) \
+	( ((0x##x##L & 0x00000001L) ? 0x01 : 0) \
+	| ((0x##x##L & 0x00000010L) ? 0x02 : 0) \
+	| ((0x##x##L & 0x00000100L) ? 0x04 : 0) \
+	| ((0x##x##L & 0x00001000L) ? 0x08 : 0) \
+	| ((0x##x##L & 0x00010000L) ? 0x10 : 0) \
+	| ((0x##x##L & 0x00100000L) ? 0x20 : 0) \
+	| ((0x##x##L & 0x01000000L) ? 0x40 : 0) \
+	| ((0x##x##L & 0x10000000L) ? 0x80 : 0))
+	
+// Declaration of functions rest called before they are been declared!
+void ShowData();
+void pt6302_ser_out(unsigned char a);
+/**************************** Start VFD Zone *****************************/
+void pt6302_init(void){
+	unsigned char i;
+
+	_delay_ms(300); //power_up delay
+
+	// set GPO pins to low
+	
+	pt6302_ser_out(BIN(01000000)); //(BIN(01000000)));   //(0b01000000)
+	//pt6302_ser_out(BIN(00000010)); //(BIN(01000000))); //(0b01000000)
+	_delay_us(60);
+	
+	// Configure VFD display (number of grids)
+	
+	pt6302_ser_out(BIN(01100111)); //(BIN(01100110))); //14 grids  (0b01100111) //15 grids  //bin(00000001) 9grids
+	_delay_us(60);
+	
+
+	// set DIMM/PWM to value
+	
+	pt6302_ser_out(BIN(01010000) | 7); //((BIN(01010000)) | 7); //0 min - 7 max  )(0b01010000)
+	_delay_us(60);
+	
+	
+	// switch off extra "ADRAM"
+	
+	pt6302_ser_out(BIN(00110000)); //(BIN(00110000)); //(0b00110000)
+	for(i=0;i<16;i++)
+	{
+		pt6302_ser_out(0x00);
+	}
+	_delay_us(60);
+	
+	// test mode: light all
+	
+	pt6302_ser_out(BIN(01110011)); //((BIN(01110011))); //on    (0b01110011)
+	_delay_us(60);
+	
+	// normal mode
+
+	pt6302_ser_out(BIN(01110000)); //((BIN(01110000))); //test off-normal mode on  (0b01110000)
+	_delay_us(60);
+}
+void pt6302_ser_out(unsigned char a){
+
+	// Note: The strobe change needs to happen when the clock is up!
+	
+	unsigned char data = 170; //value to transmit, binary 10101010
+	unsigned char mask = 1; //our bit mask
+	
+	data=a;
+	PORTB |= (1 << VFD_clk);
+	_delay_us(60);
+	PORTB &= ~(1 << VFD_stb);
+	_delay_us(60);
+	for (mask = 00000001; mask>0; mask <<= 1) { //iterate through bit mask
+		PORTB &= ~(1 << VFD_clk);
+		_delay_us(60);
+		if (data & mask){ // if bitwise AND resolves to true
+			PORTB |= (1 << VFD_in);
+		}
+		else{ //if bitwise and resolves to false
+			PORTB &= ~(1 << VFD_in);
+		}
+		_delay_us(60);
+		PORTB |= (1 << VFD_clk);
+		_delay_us(60);
+	}
+	PORTB |= (1 << VFD_clk);
+	_delay_us(10);
+	PORTB |= (1 << VFD_stb);
+	_delay_us(60);
+}
+void send_char(unsigned char a){
+	// Note: The strobe change need happen when the clock is up!
+	
+	unsigned char data = 170; //value to transmit, binary 10101010
+	unsigned char mask = 1; //our bit mask
+	
+	data=a;
+	PORTB |= (1 << VFD_clk);
+	_delay_us(60);
+	PORTB &= ~(1 << VFD_stb);
+	_delay_us(60);
+	for (mask = 00000001; mask>0; mask <<= 1) { //iterate through bit mask
+		PORTB &= ~(1 << VFD_clk);
+		_delay_us(60);
+		if (data & mask){ // if bitwise AND resolves to true
+			PORTB |= (1 << VFD_in);
+		}
+		else{ //if bitwise and resolves to false
+			PORTB &= ~(1 << VFD_in);
+		}
+		_delay_us(60);
+		PORTB |= (1 << VFD_clk);
+		_delay_us(60);
+	}
+	PORTB |= (1 << VFD_stb);
+	_delay_us(60);
+}
+void send_data(unsigned char a){
+unsigned char my_data = 170; //value to transmit, binary 10101010
+unsigned char mask = 1; //our bit mask
+	
+	my_data=a;
+	//This don't send the strobe signal, to be used in burst data send
+	for (mask = 00000001; mask>0; mask <<= 1){ //iterate through bit mask
+		PORTB &= ~(1 << VFD_clk);
+		_delay_us(60);
+		if (my_data & mask){ // if bitwise AND resolves to true
+			PORTB |= (1 << VFD_in);
+		}
+		else{ //if bitwise and resolves to false
+			PORTB &= ~(1 << VFD_in);
+		}
+		_delay_us(60);
+		PORTB |= (1 << VFD_clk);
+		_delay_us(60);
+		//PORTB = (0 << VFD_clk);
+		//_delay_us(60);
+	}
+	//PORTB |= (1 << VFD_clk);
+}
+void pt6302_print(unsigned char address, unsigned char *text){
+	unsigned char c;
+	PORTB &= ~(1 << VFD_stb); // Remember: This signal is inverted by a transistor on the board MEO...
+	send_data(BIN(00010000) | (address & 0x0F)); //((BIN(00010000)) + (address & 0x0F) );//)(0b00010000
+	
+	while(c = *text++){
+		send_data(c); // & 0x7F); // 0x7F to 7bits ASCII code
+	}
+	
+	PORTB |= (1 << VFD_stb);
+	_delay_us(60);
+}
+void send_bits(unsigned char a){
+	unsigned char mask = 1; //our bit mask
+	unsigned char data;
+	data=a;
+	PORTB |= (1 << VFD_clk);
+	_delay_us(60);
+	for (mask = 0b00000001; mask>0; mask <<= 1) { //iterate through bit mask
+		PORTB &= ~(1 << VFD_clk);
+		_delay_us(60);
+		if (data & mask){ // if bitwise AND resolves to true
+			PORTB |= (1 << VFD_in);
+		}
+		else{ //if bitwise and resolves to false
+			PORTB &= ~(1 << VFD_in);
+		}
+		_delay_us(60);
+		PORTB |= (1 << VFD_clk);
+		_delay_us(60);
+	}
+	// PORTB |= (1 << VFD_clk);
+	// _delay_us(10);
+}
+void test_VFD(void){
+  /* 
+  Here do a test for all segments of 6 grids
+  each grid is controlled by a group of 3 bytes
+  by these reason I'm send a burst of 3 bytes of
+  data. The cycle for do a increment of 3 bytes on 
+  the variable "i" on each test cycle of FOR.
+  */
+  // to test 6 grids is 6*3=18, the 8 gird result in 8*3=24.
+			for (int i =0; i< 36; i=i+3){
+			 send_char(0b01000000); // cmd 2
+			 PORTB &= ~(1 << VFD_stb);
+			 _delay_us(60);
+			 send_data((0b11000000) | i); //cmd 3 Each grid use 3 bytes here define the 1º, 2º, 3º until max address
+
+			  send_data(0b11111111); // data
+			  send_data(0b11111111); // data
+			  send_data(0b11111111); // data
+			  send_data(0b11111111); // data
+
+			  PORTB |= (1 << VFD_stb);
+			 _delay_us(60);
+
+			  send_char(0b00001000); // cmd1 Here I define the 12 grids and 16 Segments
+			  //send_char(0b00010000); // cmd1 Here I define the 12 grids and 16 Segments
+			 _delay_us(60);
+			 send_char((0b10001000) | 7);  //cmd 4
+			 //send_char((0b00010001) | 7); //cmd 4
+			 _delay_us(60);
+			}
+}
+void allON(void){
+			 send_char(0b01000000); // cmd 2
+			 PORTB &= ~(1 << VFD_stb);
+			 _delay_us(60);
+			 send_data(0b11000000); //cmd 3 
+			  PORTB |= (1 << VFD_stb);
+			 _delay_us(60);
+			  send_char(0b01110010); // All segments HIGH  This is a command to teste the PT6302 driver.
+			 _delay_us(60);
+			 send_char((0b10001000) | 7);  //cmd 4
+			 _delay_us(60);
+}
+void allOFF(void){
+	send_char(0b01000000); // cmd 2
+	PORTB &= ~(1 << VFD_stb);
+	_delay_us(60);
+	send_data(0b11000000); //cmd 3 
+	PORTB |= (1 << VFD_stb);
+	_delay_us(60);
+	send_char(0b01110001); // All segments LOW
+	_delay_us(60);
+	send_char((0b10001000) | 7);  //cmd 4
+	_delay_us(60);
+}
+void normalVFD(void){
+	send_char(0b01000000); // cmd 2
+	PORTB &= ~(1 << VFD_stb);
+	_delay_us(60);
+	send_data(0b11000000); //cmd 3
+	PORTB |= (1 << VFD_stb);
+	_delay_us(60);
+	send_char(0b01110000); // Normal display Mode operation!
+	_delay_us(60);
+	send_char((0b10001000) | 7);  //cmd 4
+	_delay_us(60);
+}
+void pt6302_cls(void){
+unsigned char i;
+  // cls DCRAM
+ PORTB &= ~(1 << VFD_stb); // Remember: This signal is inverted by a transistor on the board MEO...
+  send_data(BIN(00010000));//((BIN(00010000)));//(0b00010000);
+  for(i=0;i<16;i++)
+  {
+  send_data(' '); // Send space to clear the tube. Zone of DCRAM...
+  }
+ _delay_us(60); 
+ PORTB |= (1 << VFD_stb);
+  //
+  // cls Data Write
+  _delay_us(60);
+ PORTB &= ~(1 << VFD_stb);
+  send_data(BIN(00110000));//((BIN(00110000)));//(0b00110000);
+  for(i=0;i<16;i++) 
+  { 
+  send_data('a');
+  }
+ _delay_us(60);
+ PORTB |= (1 << VFD_stb);
+ _delay_us(60);
+}
+unsigned char DigitTo7SegEncoder(unsigned char digit, unsigned char common){
+	 unsigned char SegVal;
+	 
+	 switch(digit)
+	 {
+		 case 0:	if(common == 1)	SegVal = 0b00111111;
+		 else			SegVal = ~0b00111111;
+		 break;
+		 case 1:	if(common == 1)	SegVal = 0b00000110;
+		 else			SegVal = ~0b00000110;
+		 break;
+		 case 2:	if(common == 1)	SegVal = 0b01011011;
+		 else			SegVal = ~0b01011011;
+		 break;
+		 case 3:	if(common == 1)	SegVal = 0b01001111;
+		 else			SegVal = ~0b01001111;
+		 break;
+		 case 4:	if(common == 1)	SegVal = 0b01100110;
+		 else			SegVal = ~0b01100110;
+		 break;
+		 case 5:	if(common == 1)	SegVal = 0b01101101;
+		 else			SegVal = ~0b01101101;
+		 break;
+		 case 6:	if(common == 1)	SegVal = 0b01111101;
+		 else			SegVal = ~0b01111101;
+		 break;
+		 case 7:	if(common == 1)	SegVal = 0b00000111;
+		 else			SegVal = ~0b00000111;
+		 break;
+		 case 8:	if(common == 1)	SegVal = 0b01111111;
+		 else			SegVal = ~0b01111111;
+		 break;
+		 case 9:	if(common == 1)	SegVal = 0b01101111;
+		 else			SegVal = ~0b01101111;
+	 }
+	 return SegVal;
+ }
+void binaryToHex(const unsigned char *inStr, unsigned char *outStr) {
+	 // outStr must be at least strlen(inStr)/4 + 1 bytes.
+	 static char hex[] = "0123456789ABCDEF";
+	 int len = strlen(inStr) / 4;
+	 int i = strlen(inStr) % 4;
+	 char current = 0;
+	 if(i) { // handle not multiple of 4
+		 while(i--) {
+			 current = (current << 1) + (*inStr - '0');
+			 inStr++;
+		 }
+		 *outStr = hex[current];
+		 ++outStr;
+	 }
+	 while(len--) {
+		 current = 0;
+		 for(i = 0; i < 4; ++i) {
+			 current = (current << 1) + (*inStr - '0');
+			 inStr++;
+		 }
+		 *outStr = hex[current];
+		 ++outStr;
+	 }
+	 *outStr = 0; // null byte
+ }
+void strrevert1(char *string){
+	 // Inverter the contents of pointer of string
+	 // and let it reverted until the next call of
+	 // function! exp: char letter[16] = "jogos.....tarde";
+	 // To do a declaration of pointer:  char* ptr=letter;
+	 // don't forget the null char "\0", this is a 1 more char
+	 // presente on the string.
+	 
+	 int len = 0;
+	 while (string[len])
+	 len++;
+
+	 int down = 0;
+	 int up = len - 1;
+
+	 while (up > down)
+	 {
+		 char c = string[down];
+		 string[down++] = string[up];
+		 string[up--] = c;
+	 }
+ }
+ 
+/*****************************************************************/
+/************************ END VFD Zone ***************************/
+/*****************************************************************/
+
+void intVector(void){
+	//Code Block to Interrupt of IR... and show value of code received!!!
+	if(edge == 0)
+	{
+		edge = 1;  //we've had a rising edge
+		overflows = 0; //start counting overflows
+	} 
+	else 
+	{
+	edge = 0;  //we've had a falling edge; interpret the pulse lengths as 0, 1, or start
+	timer = overflows; //lock in the current value of the overflow counter
+		
+	if(inData == 1)  //if we are listening for a signal
+		{
+		//PORTC ^= (1 << PINC4);
+			if( timer > ONE_SIZE )  //if the pulse is long enough, set array value to binary 1
+			{
+				PORTC ^= (1 << PINC4);
+				data[dataIndex] = '1';
+				dataIndex++;
+				
+			} 
+			else 
+				if( timer > ZERO_SIZE )  //if the pulse is long enough, set array value to binary 0
+				{
+				
+					data[dataIndex] = '0';
+					dataIndex++;
+				
+				}
+			
+				if(dataIndex > 12)
+				{
+					inData = 0;
+					dataIndex = 0;
+					recData = 1;
+				}
+		} 
+		else 
+		{
+			if( timer >= start_length )  //if the pulse is long enough, start listening for the rest of the signal
+			{
+				//PORTC ^= (1 << PINC5);
+				inData = 1;
+			}
+		}
+	}
+if(dataIndex >= 12)
+ShowData();
+}
+char readButton(void){
+	if((PIND & (1 << 0x02)) == 0){      //If the button was pressed
+	_delay_us(25); }					//Debounce the read value
+	if((PIND & (1<<PIND2)) == 0)		//Verify that the value is the same that what was read
+	{
+		return 1;
+	}
+	else                       //If it is still 0 its because we had a button press
+	{
+		return 0;                 //If the value is different the press is invalid
+	}
+}
+void ShowData(){
+	cli();
+	pt6302_cls();
+	_delay_ms(20);
+	//strcpy(tmp, "FEA5");
+	//strrevert1(data);
+	//itoa(overflows, tmp, 10);
+	binaryToHex(data, tmp);
+	//pt6302_cls();
+	//strcpy(data, "RUNNING");  // This is presented with success!
+	//itoa(dataIndex, data, 10);
+	//pt6302_print(3, data);
+	pt6302_print(3, tmp);  // This do the presentation of IR code received!!! check
+	timer=0;
+	dataIndex = 0;
+	triggerEvent=0;
+	numberEvents=0;
+	sei();
+}
+void BuildArray(){
+	dataOverflows[dataIndex]=overflows;
+	overflows=0;
+	dataIndex++;
+}
+void ShowArray(){
+	cli();
+	for(int i=0; i<=dataIndex; i++){
+		pt6302_cls();
+		itoa(dataOverflows[i], tmp, 10);
+		pt6302_print(3, tmp);
+		_delay_ms(700);
+	}
+	sei();
+}
+void msg(void){
+// This function is responsible to present the initial messages and blinking of VFD
+	for(int n=0; n< 5; n++){
+		allON();
+		_delay_ms(1000);
+		allOFF();
+		_delay_ms(200);
+	}
+normalVFD();  //Return to normal display mode!
+_delay_ms(1000);
+test_VFD();
+_delay_ms(1000);
+
+unsigned char info1[]= "HI FOLKS";  // Fill one array of chars with char!
+unsigned char* ptrInfo1;	// Declare ptrInfo1 as a pointer
+ptrInfo1=info1;				// Define where the pointer is pointing now
+pt6302_print(3, ptrInfo1);	// Call function to present the contents of memory position wich pointer is pointing.
+_delay_ms(3000);
+
+unsigned char info2[]= "Infra Red...";
+unsigned char* ptrInfo2;
+ptrInfo2=info2;
+pt6302_print(3, ptrInfo2);
+_delay_ms(3000);
+
+pt6302_cls();
+_delay_ms(60);
+}
+	//************************MAIN & ISR*****************************//
+int main(){
+	cli();  // Avoid the interrupts activate until activated by the "sei();"
+	
+	//MCUCR |= (1 << PUD);  // This disable all pull-up when set to one!
+	
+	DDRC= 0b00111100;  //Control of led of button on/off of board kmm3000 PC4 and PC5 both trough R26 & R27 of 290 ohms PC2 reset 6302
+	PORTC=0x04;  // Activate pull-up resistor on the pin PC0 & PC1
+
+	DDRB = 0b11000001;
+	PORTB=0x04;
+	
+	DDRD = 0b11111000; // ... also define port PD2 as input...
+	PORTD= 0b11111000;    // ... also put the pull-up resistor to PD2 with PORTD=0x04; Já tenho uma R10K ao mais para fazer pull-up.
+	
+	//DIDR1 |= (1 << AIN1D) |  (1 << AIN0D); // Deativate the Analogic input to keep power
+	
+	// Configuration of trigger of change pin's
+	EIMSK |= (1 << INT0);// | (1 << INT1); // Enable INT0 and INT1
+	//EICRA |= (1 << ISC01); //Trigger on falling edge of INT0
+	//EICRA |= (1 << ISC01) | (1 << ISC00); //Trigger on rising edge of INT0
+	EICRA |= (0 << ISC01) | (1 << ISC00); //Trigger on any logic change  of INT0
+	
+	PCMSK0 |= (1 << PCINT2);  // set PCINT0 to trigger an interrupt on state change on pins from PCINT0-7
+	PCICR |= (1 << PCIE0);    // set PCIE0 to enable PCMSK0 scan
+	
+	//PCMSK2 |= (1 << PCINT23) | (1 << PCINT22) | (1 << PCINT21);  // set PCINT2 to trigger an interrupt on state change PCINT23-16
+	//PCICR |= (1 << PCIE2);  // enable the interrupt vector 2
+	
+	// Timer Counter Control Register B
+	// Must be /64 or more for ISR timing
+	//TCCR0B |=  (0 << CS02) | (0 << CS01) | (1 << CS00);	// No prescaler   (56 uSec)
+	TCCR0B |=  (0 << CS02) | (1 << CS01) | (0 << CS00);		// prescaler 8    (508 uSec)
+	//TCCR0B |=  (0 << CS02) | (1 << CS01) | (1 << CS00);	// prescaler 64   (4 mSec)  //
+	//TCCR0B |=  (1 << CS02) | (0 << CS01) | (0 << CS00);	// prescaler 256	(16 mSec)
+	//TCCR0B |=  (1 << CS02) | (0 << CS01) | (1 << CS00);	// prescaler 1024	(64 mSec)
+	
+	//Mode WGM02 WGM01 WGM00 Timer/Counter Mode of Operation TOP Update of OCR0x at TOV Flag 
+	//Set on(1)(2) 0 0 0 0 Normal 0xFF Immediate MAX 
+	
+	//TCCR2B |=  (0 << CS22) | (1 << CS21) | (1 << CS20); // prescaler 64   (4 mSec)  //
+	
+	//TCCR0A |= (0 << WGM01) | (0 << WGM00);
+	//TCCR0B |= (0 << WGM02);
+
+	//TCCR2A |= (0 << WGM21) | (0 << WGM20);
+	//TCCR2B |= (0 << WGM22);
+	// Timer Counter Interrupt Mask Register
+	// both output compare interrupts
+	TIMSK0 |= (0 << OCIE0A) | (0 << OCIE0B);  // disable the output compare timer0 A & B
+
+	// Timer Counter Overflow Interrupt Enable
+	TIMSK0 |= (1 << TOIE0);
+	//TIMSK2|=(1<<TOIE2);
+	//TCNT2=0x00;
+	//OCR0A = 0xEF;
+	//OCR0B = 0x7F;
+	TCNT0=0x00;
+	
+PORTC &=~(1 << rst6302);
+_delay_ms(20);
+PORTC |=(1 << rst6302);
+_delay_ms(20);
+pt6302_init();
+_delay_ms(500);
+pt6302_cls();
+_delay_ms(20);
+
+msg();
+
+strcpy(data, "STARTING...");
+ShowData();
+_delay_ms(1000);
+pt6302_cls();
+_delay_ms(60);
+
+char keyPress[2];
+char* ptrKey;
+ptrKey=keyPress;
+strcpy(keyPress, "1-2");
+
+	sei();  //global interrupt enable
+	
+	 PORTD ^= (1 << PD4);  //toggle the PD4 to allow the counter of 4017 on low reset status
+
+	 while (1){
+		 // Zone of Counter on display by 1 second
+		 number++;
+		 if (number >= 4) {counter++; number =0;} // only increment the counter after 4 times
+		 itoa(counter, tmp, 10);
+		 pt6302_print(7, tmp);
+		 PORTC ^= (1 << PC4);	// toggle LED on PC4
+		 _delay_ms(250);		// 1000 to do a delay of 1 sec, take not with the timer with the other operations!!!
+		 // End Zone of counter display
+		 
+		 // Zone of matrix key
+		 strcpy(keyPress, "---");
+		  //first column
+		  _delay_ms(5);
+		  PORTD ^= (1 << PD5);//
+		  _delay_us(5);
+		  //check for rows and send key number to portD
+		  //instead sending key number to PORTD you can use
+		  //any function that serves pressed button
+		 if(!(PINC & (1<<PC0)))  { keyPress[1] = '>'; keyPress[2] = '>'; }
+		 if(!(PINC & (1<<PC1)))  keyPress[0] = 'U';
+		 if(!(PINB & (1<<PB1)))  { keyPress[0] = '<'; keyPress[1] = '<'; }
+		  //second column
+		 PORTD ^= (1 << PD5);
+		 PORTD ^= (1 << PD6);
+		   _delay_us(5);
+		  if(!(PINC & (1<<PC0)))  keyPress[2] = '>';
+		  if(!(PINC & (1<<PC1)))  keyPress[1] = 'C';
+		  if(!(PINB & (1<<PB1)))  keyPress[1] = 'P';
+		  //third column
+		 PORTD ^= (1 << PD6);
+		 PORTD ^= (1 << PD7);
+		   _delay_us(5);
+		  if(!(PINC & (1<<PC0)))  keyPress[2] = 'D';
+		  if(!(PINC & (1<<PC1)))  keyPress[0] = '<';
+		  if(!(PINB & (1<<PB1)))  keyPress[2] = 'J'; // this is not implemented on the key set... only have 8 buttons.	
+		   _delay_us(5);
+		  PORTD ^= (1 << PD7);
+		  
+		   if (keyPress[1] == 'P'){
+			   PORTD ^= (1 << PD4);
+			   _delay_ms(10);
+			   PORTD ^= (1 << PD4);
+			   counter=0;
+			   pt6302_cls();  // Clear digits of counter on VFD grids.
+		   }
+		  
+		  if (keyPress[1] == 'C'){
+			  if (flagTF)
+			  flagTF = 0;
+			  else
+			  flagTF = 1;
+		  }
+		  
+		  if (flagTF)
+		    PORTC ^= (1 << PC3);	// toggle LED on PC3 to count on CD4017 external
+			
+	pt6302_print(12, ptrKey);
+	}
+}
+
+ISR(INT0_vect, ISR_NOBLOCK){
+	//Attention: Don't do confusion with PCINT0...' Do regular reset to this case mistake!
+	//This interrupt call the presentation of code received in IR
+	intVector();
+}
+ISR(TIMER0_OVF_vect, ISR_NOBLOCK){  //increment overflows counter when an overflow happens
+	overflows++;
+	overflowsLED++;
+	if (overflowsLED>=5000) //Time to change the state of LED red from button S8 of KMM3000 board panel
+	{
+		PORTC ^= (1 << PINC5);
+		overflowsLED=0;
+	}
+	//TCNT0=0x00;
+}
+ISR(PCINT0_vect){
+	uint8_t changedbits;
+
+	changedbits = PINB ^ portbhistory;
+	portbhistory = PINB;
+	
+	if(changedbits & (1 << PINB2))
+	{
+		strcpy(data, "Interrupt B2");  // This is the interrupt of external button!
+		//
+		pt6302_print(3, data);
+		PORTC ^= (1 << PINC5);
+		_delay_ms(50);
+		PORTC ^= (1 << PINC5);
+		_delay_ms(50);
+		PORTC ^= (1 << PINC5);
+		_delay_ms(50);
+		PORTC ^= (1 << PINC5);
+		_delay_ms(50);
+		//
+		pt6302_cls();
+	}
+
+}
+ISR(TIMER2_OVF_vect, ISR_NOBLOCK){  //increment overflows counter when an overflow happens
+	overflows++;
+	TCNT2 = 200; // is necessary set to "0" to trigger the event OVF again...
+}
+ISR (TIMER0_COMPA_vect){ //timer0_ovf_isr(void)
+	counter++;
+}
+
+/*
+comment #1: (1 << PD2) generates the binary 00000100. The operation "~" flips all the digits, i.e., the binary now is 11111011. 
+Finally the &= applies the logic "AND" between DDRD and 11111011 and the result is placed again in DDRD memory. Note: What the 
+operator "AND" does is for each bit in the DDRD memory, it compares with the binary number above. If the bit in DDRD is 0 and 
+the bit in the binary at the same bite position is 1, then the resulting bit is 0, if the DDRD is 1 and the bit in the binary
+ is 1, the resulting bit is 1, and if the bit in the DDRD is 1 or 0 and the bit in the binary is 0 then the resulting bit is 
+ always 0. In summary, the command DDRD &= ~(1 << PD2) changes only the bit PD2 to zero and leave the other ones (zeros or ones)
+  untouched. It seems a little bit complicated, but after you get used to it, it is the best way of changing a bit in a bite 
+  without changing the other bits.
+comment #2: (1 << PD2) generates the binary 00000100. Using the same logic "AND" described in comment #1, the command 
+"PIND & 0000100" checks only if the PIND2 (our input pin where the push button is connected to) is set to high or not. 
+All the other pins will be FALSE since the binary bits are set to 0, and since the binary bit #2 is set to 1, the IF statement
+ will be TRUE only if the PD2 input is set to high or FALSE if the PD2 input is set to low.
+comment #3: Following the logic explained in comment #1, this command sets output pin PINB2 in port PORTB to high voltage. 
+If your LED is correct connected to this pin port with a resistor of ~300 ohms, and that resistor is connected to the ground, 
+the LED should turn on.
+comment #4: The LED should turn off for the same reasons explained in the previous comments.
+
+//looking for bit zero of port D to be a one:
+// if(PIND & 0x01){take_some_action();} 
+	
+//looking for bit 5 of port B to be a zero:
+// if(~PIND & 0x20){take_action();} 
+*/
